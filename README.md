@@ -1,62 +1,118 @@
-# Nity (Continuity)
-**Deterministic traffic continuity for Kubernetes, inspired by Eulerian fluid mechanics.**  
-Nity treats requests as **fluid** and backends as fixed points on a mesh. Instead of tracking “individual particles” (requests/users), it controls **pressure fields** and **flow capacity** to keep traffic moving smoothly under stress.
+# Continuity
+**Deterministic traffic continuity for Kubernetes, inspired by Eulerian fluid mechanics.**
 
-## What problem it solves
-Most traffic failures aren’t “one bad request” — they’re **systemic loss of control**: queues grow, latency spikes, retries explode, nodes stall, and the cluster starts oscillating (flapping).  
-Nity focuses on one thing: **continuity** — maintaining stable flow within safe limits, and degrading gracefully when physics says you’re out of capacity.
+Nity treats service traffic as **fluid** and backends as fixed points on a mesh. Instead of tracking individual requests in the decision layer (Lagrangian view), it controls **pressure fields** and **flow capacity** at **backend slots** (Eulerian view) to keep traffic moving, predict loss of control early, and avoid oscillations.
 
-## Why “Eulerian fluids”
-There are two ways to reason about flow:
-- **Lagrangian:** track each particle (each request) → expensive, noisy, and often unstable at scale.
-- **Eulerian:** observe the field at fixed points → stable, bounded cost, and closer to how control systems work.
+Nity is built as a **kernel dataplane (eBPF)** plus a **deterministic control-plane**. The dataplane stays **O(1)** per connection event; the control-plane updates the “field” in discrete ticks and can fail-safe without blackholing.
 
-Nity is Eulerian by design: it doesn’t “decide per request” in the control plane; it updates a **field** (routing capacity) based on measured pressure.
+---
 
-## How it works (high level)
-Nity is split like real control systems:
+## What Nity is (and is not)
 
-- **Dataplane (eBPF):** fast, O(1), deterministic decisions on the hot path.  
-  Think: *valves + pipes*.
+**Nity is:**
+- A **continuity controller** for Kubernetes traffic (prioritizes flow stability over “perfect routing”).
+- **Deterministic**: every action is explainable by a finite set of physical rules.
+- **Fast-sensing**: uses ms–s signals (e.g., PSI stall, kernel counters) to act before p95/p99 graphs tell the full story.
+- **Fail-safe by design**: if the agent is stale or down, dataplane behavior remains coherent.
 
-- **Control-plane (agent):** periodic control loop that reads pressure signals and updates the field.  
-  Think: *regulator adjusting valves with viscosity and hysteresis to avoid oscillation*.
+**Nity is not:**
+- A generic “send traffic anywhere” router. Traffic only moves **within the equivalent backend set** for a given Service/route.
+- A promise of infinite throughput. If there’s no spare capacity, the correct physics is **admission control** (backpressure) and/or **scaling**.
 
-### Core physical ideas (translated to systems)
-- **Pressure:** not just latency — a weighted resistance signal (queue/latency/errors/stalls).
-- **Conductance:** “how much flow the system can still pass” (global health proxy).
-- **Viscosity:** bounded change per cycle (slew-rate) to prevent control flapping.
-- **Backpressure:** protect the system by slowing/denying new admissions when needed.
-- **TTF (Time-To-Failure):** “how long until loss of control?” beats “latency up 20%”.
-- **PSI stall gate:** resource usage matters only when it causes **stall / lack of progress**.
+---
 
-## Features (current direction)
-Nity aims to provide:
-- **Pressure-driven traffic distribution** (capacity moves away from sick backends)
-- **Stable control** (slew-rate + hysteresis; no random load “dice”)
-- **Global backpressure modes** (soft/hard) to prevent retry storms
-- **Fail-safe behavior** (field stays coherent if the agent dies)
-- **Deterministic, explainable decisions** (every action maps to a physical cause)
-- **Auditability** (Prometheus/Grafana can be used for summaries; not the primary sensor)
+## Core principles (physics → behavior)
 
-## What it is not
-- Not “AI routing”
-- Not a service mesh replacement
-- Not a per-request policy engine
-- Not a magic throughput generator (physics still wins)
+### Eulerian indifference (Axiom Zero)
+The decision layer does not track “the user” or “the request.” It observes fields:
+- **Pressure** (resistance to flow) at each backend
+- **Conductance** (how much flow can pass per unit pressure)
 
-## Status
-This project is evolving around a “physical MVP”: a small set of laws that already guarantees continuity (bounded cost, stable allocation, backpressure, fail-safe).  
-The full design is written as a “constitution” of physical invariants and measurable metrics.
+### Pressure is more than latency
+Pressure is a composite of forces that resist flow (queue/latency/errors, and optionally path/node signals). Errors act like leaks: they carry a disproportionate penalty.
 
-## Philosophy
-Most “AI for ops” tries to learn behavior from data. Nity tries to **encode constraints** so the system behaves like a stable physical process: predictable, bounded, and explainable — closer to *control theory* than *black-box optimization*.
+### Viscosity prevents flapping
+Nity never changes flow allocation abruptly. Slot updates are bounded by a **slew-rate** to damp oscillations.
+
+### Continuity over perfection
+When the system approaches loss of control, Nity protects continuity with:
+- progressive isolation of sick backends
+- controlled diagnostic drip
+- **backpressure** at the boundary (soft → hard)
+- slow recovery (hysteresis + “queue debt” paydown)
+
+---
+
+## Architecture (high level)
+
+- **Dataplane (eBPF, per node):**
+  - deterministic selection (laminar “gear”)
+  - stickiness via conntrack LRU
+  - atomic epoch flip (A/B tables)
+  - admission enforcement (normal/soft/hard)
+  - fail-safe modes (HOLD → FALLBACK)
+
+- **Control-plane (agent, per node):**
+  - computes pressure/TTF/PSI-derived pathology
+  - updates the inactive slot table, then flips epoch atomically
+  - publishes low-cardinality audit metrics (Prometheus-friendly)
+
+Why per-node agent (DaemonSet)? Because sensors and actuators are node-local: it reduces control latency, avoids network blind spots, and improves failure containment.
+
+---
+
+## Regimes vs states (don’t mix them)
+
+**Regimes** are high-level postures:
+- **Laminar (normal):** stable flow, small corrections, high predictability
+- **Transition (degradation):** signals worsen, firmer corrections, selective isolation
+- **Crisis (survival):** protect the system; hard deny; strict safety
+- **Recovery:** slow reopening; hysteresis; queue-debt paydown
+
+**States** are the concrete machine modes enforced by dataplane:
+- `admission_mode ∈ { normal, soft, hard }`
+- `failsafe_mode  ∈ { normal, hold, fallback }`
+
+Regimes *choose* states. Failsafe states can override regimes when the agent is stale.
+
+---
+
+## The critical real-world constraint: equivalence sets
+Nity can only redistribute traffic **within the equivalent backend set** for a Service/route (same semantics, same selector).  
+If a Service has **only one replica**, there is no alternative backend to offload to—Nity switches from redistribution to **admission control** and can emit a **scale hint** (optional) rather than pretending there is a “second route.”
+
+---
+
+## Telemetry policy
+Nity’s control loop uses **ms–s** signals for real-time decisions.  
+**Prometheus/Grafana** are used for **auditability** and low-cardinality summaries, not as primary sensors.
+
+---
+
+## Project status
+This repository is under active development. 
+- ✅ Core model: pressure/viscosity/admission/failsafe
+- ✅ Documentation: constitution + regimes/states
+- 🚧 Implementation:  dataplane + agent wiring (in progress)
+- 🔜 Harness: invariant tests (sim/replay) for physics CI
+
+---
 
 ## Contributing
-If you like eBPF, control loops, SRE failure modes, or you want to stress-test the invariants with real scenarios (retry storms, churn, stalls), contributions are welcome. Start by opening an issue describing:
-- the failure mode,
-- the observable signals,
-- and what invariant should hold.
+Contributions are welcome, especially around:
+- eBPF correctness + verifier-friendly patterns
+- invariant testing (bounded dp cost, bounded remap, monotonic skew under stable topology)
+- documentation clarity (regimes/states, operational rules)
+
+If you submit a change that affects behavior, please describe which invariant(s) it preserves or strengthens.
+
+---
 
 ## License
-TBD (project intends to be open source).
+Planned: Apache-2.0 (or similar permissive license).  
+(If `LICENSE` isn’t present yet, it will be added early to avoid ambiguity.)
+
+---
+
+## Name
+**Nity** is the project nickname. **Continuity** describes its purpose: preserve the continuity of flow under stress.
