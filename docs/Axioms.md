@@ -1,4 +1,4 @@
-# Nity / Continuity — Hydraulic Constitution v5.0 (Full, 24 Articles)
+# Continuity Constitution
 > **Format:** descriptive + operational (description, metrics, equations)  
 > **Scope:** Kubernetes traffic continuity via **eBPF dataplane** + **deterministic control-plane**  
 > **Rendering note:** Many Markdown viewers do **not** support LaTeX/MathJax.  
@@ -72,6 +72,17 @@ if err_rate_b > η:
 Desired weight:
 ```text
 w_b = (1/(P_b+ε)) / sum_i (1/(P_i+ε))
+
+Extended weight (when capacity, topology, and dependency pressure are modeled):
+w_b =
+  (capacity_factor_b / ((P_total_b + ε) * topo_penalty_b))
+  /
+  sum_i (capacity_factor_i / ((P_total_i + ε) * topo_penalty_i))
+
+where:
+  topo_penalty_b = 1 + λ_topo * topology_cost_b
+  P_total_b = P_backend(b) + W_dep * P_dependency(service)   (if dependency pressure is used)
+
 ```
 
 Target slots:
@@ -189,6 +200,34 @@ hit_ratio = hits / (hits + misses + ε)
 remap_rate = remaps / (flows_sampled + ε)
 ```
 
+### Real-World Amendment — The “Particle” Might Be a Connection (HTTP/2, gRPC, keep-alive)
+#### Description
+In many modern systems, a single connection can carry many requests (multiplexing).
+If Nity only reacts when **new connections** appear, it may react late when load spikes **inside existing connections**.
+This is not a failure — it is a limit of the observation point.
+The constitution makes the limit explicit and defines a simple fix: **use a lightweight load estimate** (requests/s if visible, otherwise bytes/s).
+
+#### Metrics
+- **RT:** `requests_per_connection{backend}` (if available), `bytes_per_connection{backend}`, `multiplexing_factor{service}`
+- **Audit:** histograms/quantiles of requests per connection (or bytes per connection)
+
+#### Equations
+```text
+if requests are observable (e.g., in-band header, sidecar, or app signal):
+  load_est = requests_per_sec
+else:
+  load_est = bytes_per_sec
+
+requests_per_connection = requests_per_sec / (new_connections_per_sec + ε)
+
+multiplexing_factor = clip(requests_per_connection / R_ref, 0, M_max)
+
+rule:
+  if multiplexing_factor is high:
+    do not rely only on connect() events for control decisions
+    incorporate load_est into pressure and admission decisions
+```
+
 ---
 
 ## Article 5 — Topological Continuity (Weighted Consistent Mapping Under Churn)
@@ -203,6 +242,58 @@ Topology changes must not reshuffle the universe. Remaps should be local and pre
 ```text
 remap_% = changed_flows / (flows_sampled + ε) * 100
 policy: remap_% <= ρ_max for small churn
+```
+
+### Real-World Amendment — Equivalent Backend Sets and Monopoly Mode
+#### Description
+Nity can only “redistribute” traffic **within a set of backends that can truly do the same job**.
+A pod for *serviceA* cannot serve *serviceB*.
+If there is only **one** backend in the equivalent set, there is **no alternate internal route**.
+In that case Nity enters **Monopoly Mode**:
+- preserve what already entered;
+- reduce what is still trying to enter (backpressure);
+- optionally emit a **ScaleHint** (a request for more capacity) if policy allows.
+
+#### Metrics
+- **RT:** `backend_set_size{service}`, `monopoly_mode{service}`, `scale_hint_total{service,reason}`
+- **Audit:** `nity_backend_set_size{service}`, `nity_monopoly_mode{service}`, `nity_scale_hint_total{reason}`
+
+#### Equations
+```text
+backend_set_size(service) = |B_service|
+
+redistribution_possible = 1 if backend_set_size(service) >= 2 else 0
+
+monopoly_mode(service) = 1 - redistribution_possible
+
+if monopoly_mode == 1:
+  - slots cannot "migrate" to another backend (there is none)
+  - the field may only:
+      (a) apply backpressure (Article 14)
+      (b) request capacity via ScaleHint (Article 19)
+```
+
+### Real-World Amendment — Rollout / High Churn Mode
+#### Description
+During rollouts, pods appear and disappear quickly. If the controller tries to optimize aggressively while the ground is moving,
+it can flap, remap too much, and create turbulence.
+When churn is high, the goal becomes: **do not oscillate and do not make things worse**.
+
+#### Metrics
+- **RT:** `backend_set_changes_per_min{service}`, `rollout_mode{service}`, `remap_percent{service}`
+- **Audit:** time spent in rollout mode, remap percent during rollout
+
+#### Equations
+```text
+churn_rate = backend_set_changes / minute
+rollout_mode = 1 if churn_rate > churn_threshold else 0
+
+when rollout_mode == 1:
+  Δ_max = min(Δ_max, Δ_rollout)
+  T_hold = max(T_hold, T_hold_rollout)
+  ramp-up rules for newborn backends (Article 10 amendment) are mandatory
+
+remap_percent(service) = (flows_remapped / (flows_sampled + ε)) * 100
 ```
 
 ---
@@ -240,6 +331,70 @@ Pressure is decomposed to avoid false positives: backend, path, and node.
 P_backend(b) = WQ*Q*(b) + WL*L*(b) + WE*E*(b) + WC*C*(b)
 
 P_node(n) = Wpsi*PSI*(n) + Wfd*FD*(n) + Wct*CT*(n) + Wio*IO*(n)
+```
+
+### Real-World Amendment — Replicas Are Not Truly Identical (Heterogeneity)
+#### Description
+In real clusters, two replicas of the “same” app can behave differently: noisy neighbors, throttling, cold caches, slower disks, etc.
+Nity models this with a simple **capacity factor** per backend, derived from observed completions.
+
+#### Metrics
+- **RT:** `service_rate_rps{backend}`, `capacity_factor{backend}`
+- **Audit:** distribution of capacity factors per service
+
+#### Equations
+```text
+mu_b = completed_requests_in_window / window_seconds
+mu_ref = median(mu_i for i in equivalent_backends)
+
+capacity_factor_b = clip(mu_b / (mu_ref + ε), cap_min, cap_max)
+
+use (together with pressure):
+  weight_b ∝ capacity_factor_b / (P_total_b + ε)
+```
+
+### Real-World Amendment — Locality and Topology Cost (Not All Routes Cost the Same)
+#### Description
+Moving traffic "far" can be expensive: higher latency, more retransmits, crossing zones, or hitting cost boundaries.
+Nity prefers local routes when possible and only crosses topological borders when necessary.
+
+#### Metrics
+- **RT:** `topology_cost{backend}` (e.g., 0 same node, 1 same zone, 2 other zone), `locality_ratio{service}`
+- **Audit:** locality ratio over time, topology cost aggregates
+
+#### Equations
+```text
+topo_penalty_b = 1 + λ_topo * topology_cost_b
+
+use (together with pressure):
+  weight_b ∝ 1 / ((P_total_b + ε) * topo_penalty_b)
+
+locality_ratio(service) = local_traffic / (total_traffic + ε)
+```
+
+### Real-World Amendment — Dependency Pressure (The Pod Is Fine, the World Is Not)
+#### Description
+Sometimes the app slows down because a dependency (database, queue, external API) slows down.
+The pod is not “broken” — it is being forced to wait.
+Nity separates this signal so it can:
+- avoid blaming the wrong backend;
+- apply backpressure early to prevent queues/retry storms;
+- expose a clear “external pressure” metric.
+
+#### Metrics
+- **RT:** `dependency_timeout_rate{service}`, `dependency_error_rate{service}`, `dependency_wait_ms_p95{service}`, `pressure_dependency{service}`
+- **Audit:** dependency pressure time-series, dependency collapse events
+
+#### Equations
+```text
+TO* = timeout_rate / (TO_ref + ε)
+ER* = error_rate   / (ER_ref + ε)
+WT* = wait_p95_ms  / (WT_ref + ε)
+
+P_dependency(service) = W_to*TO* + W_er*ER* + W_wt*WT*
+
+used together with backend pressure:
+  P_total_b = P_backend(b) + W_dep * P_dependency(service)
 ```
 
 ---
@@ -294,6 +449,27 @@ tokens_b(t) = min(B, tokens_b(t-Δt) + r*Δt) - used
 cooldown_{k+1} = min(C_max, γ*cooldown_k)
 ```
 
+### Real-World Amendment — Birth Ramp (Ready Does Not Mean Fully Capable)
+#### Description
+A backend can be marked Ready and still not be ready for full load (cold caches, warmup, connection pools, runtime stabilization).
+New backends enter the field as “pipes still filling”: they start with low flow and ramp up.
+
+#### Metrics
+- **RT:** `backend_age_seconds{backend}`, `warmup_ramp_factor{backend}`, `warmup_duration_seconds{service}`
+- **Audit:** time to reach ramp=1, failures during warmup
+
+#### Equations
+```text
+age_seconds = now - backend_start_time
+
+ramp_factor = clamp(age_seconds / T_warmup, 0, 1)
+
+slots_target_effective = round(slots_target * ramp_factor)
+
+used together with viscosity (Article 8):
+  Δs_b = clip(slots_target_effective - s_cur_b, -Δ_max, +Δ_max)
+```
+
 ---
 
 ## Article 11 — Evacuation Principle (Long-Lived Flows Under Degradation)
@@ -329,6 +505,31 @@ TTF_node   = min_r TTF_r
 TTF_system = min(TTF_node, TTF_backend_or_system)
 ```
 
+### Real-World Amendment — Reaction Window (Scaling and Recovery Take Time)
+#### Description
+Detecting trouble early is not enough: creating usable capacity takes time, and the time is not constant.
+The system must compare **TTF** against the **measured time-to-act**.
+The right question is: “Do we have enough time left to react?”
+
+#### Metrics
+- **RT:** `actuation_time_seconds_p95{service}`, `reaction_window_seconds{service}`, `ttf_service_seconds{service}`
+- **Audit:** actuation-time histograms/quantiles, breaches where TTF < reaction window
+
+#### Equations
+```text
+Measured actuation time:
+T_act = T_schedule + T_pull + T_init + T_warmup + T_ready + T_endpoints
+
+Reaction window:
+T_react = p95(T_act) + safety_margin
+reaction_window_seconds = T_react
+
+Rule:
+  if TTF_service < T_react:
+    - activate backpressure earlier (Article 14)
+    - emit ScaleHint immediately if policy allows (Article 19)
+```
+
 ---
 
 ## Article 13 — Stall Filter (PSI Defines Pathology)
@@ -357,14 +558,23 @@ System survival outranks external demand; boundary admission switches normal/sof
 
 ### Equations
 ```text
-G = sum_b (slots_b / (P_b + ε))
+G = sum_b (slots_b / (P_total_b + ε))
 
-normal if (TTF_system >= T_safe) and (stall_sust == 0) and (G >= G_min)
-soft   if (TTF_system <  T_safe) or  (G <  G_min)
-hard   if (TTF_system <  T_hard) or  (stall_sust == 1)
+base mode selection:
+  normal if (TTF_system >= T_safe) and (stall_sust == 0) and (G >= G_min)
+  soft   if (TTF_system <  T_safe) or  (G <  G_min)
+  hard   if (TTF_system <  T_hard) or  (stall_sust == 1)
 
-optional:
-RSI = (retries/sec) / (success/sec + ε)
+Real-World Amendment — Retry Storm (Positive Feedback Loop):
+RSI = retry_rate_per_sec / (success_rate_per_sec + ε)
+
+RSI can override base selection to stop positive feedback early:
+  if RSI >= r2: admission_mode = hard
+  elif RSI >= r1: admission_mode = soft
+  else: admission_mode = (base selection)
+
+optional controlled delay in SOFT mode (to slow retries without hard-failing):
+  delay_ms = clamp(d0 * (RSI / (r1 + ε)), 0, d_max)
 ```
 
 ---
@@ -455,6 +665,28 @@ stage =
   1 if (TTF_backend < T_scale) and (stall_sust == 0)
   2 if (stall_sust == 1) and (mem/io dominates)
   3 if (G < G_min) and (no local headroom)
+```
+
+### Real-World Amendment — Capacity Requests (ScaleHint) When Physics Has No Spare Route
+#### Description
+When there is no alternate internal route (Monopoly Mode) or when TTF is below the reaction window,
+continuity cannot come from redistribution alone. Nity must ask for capacity.
+This is not “magic automation” — it is a clear, explicit signal that another component may consume (HPA, operator, or human).
+
+#### Metrics
+- **RT:** `scale_hint_total{service,reason}`, `scale_hint_active{service}`
+- **Audit:** scale-hint counts and outcomes
+
+#### Equations
+```text
+emit_scale_hint = 1 if (
+  (monopoly_mode(service) == 1) OR (TTF_service < T_react)
+) else 0
+
+reason examples:
+  - monopoly
+  - ttf_below_reaction_window
+  - systemic_conductance_low
 ```
 
 ---
@@ -585,4 +817,4 @@ T_hard: 10–30s
 
 ---
 
-**End of Constitution**
+**End of Constitution v5.0**
