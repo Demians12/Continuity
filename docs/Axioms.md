@@ -1,7 +1,8 @@
 # Nity / Continuity — Hydraulic Constitution v5.0 (Full, 24 Articles)
 > **Format:** descriptive + operational (description, metrics, equations)  
 > **Scope:** Kubernetes traffic continuity via **eBPF dataplane** + **deterministic control-plane**  
-> **Telemetry policy:** the control loop uses **ms–s** signals; **Prometheus/Grafana** are for **auditability** (low-cardinality summaries), not as primary sensors.
+> **Rendering note:** Many Markdown viewers do **not** support LaTeX/MathJax.  
+> This file uses **plain-text equations** inside fenced code blocks for universal readability.
 
 ---
 
@@ -21,793 +22,547 @@ The decision layer is **Eulerian**: it observes **pressure fields** and **flow v
 - Robust-derivative window: **Δ** (typ. 2–10s)
 
 **EWMA**
-
-$$
-
-\tilde{x}(t)=\alpha x(t) + (1-\alpha)\tilde{x}(t-\Delta t)
-
-$$
+```text
+x_tilde(t) = α*x(t) + (1-α)*x_tilde(t-Δt)
+```
 
 **Robust derivative (positive consumption only)**
-
-$$
-
-v_x(t)=\max\left(0,\frac{\tilde{x}(t)-\tilde{x}(t-\Delta)}{\Delta}\right)
-
-$$
+```text
+v_x(t) = max(0, (x_tilde(t) - x_tilde(t-Δ)) / Δ )
+```
 
 ### Normalization
-
-$$
-
-x^*(t)=\frac{x(t)}{x_{ref}}
-
-$$
+```text
+x*(t) = x(t) / x_ref
+```
 
 ### Resource pathology gate (PSI)
-For a resource $r \in \{cpu,mem,io\}$ and a window $W$:
-
-$$
-
-stall(W)=\mathbf{1}\left[\mathrm{PSI}^{full}_r(W)>\theta^{full}_r\right] \lor \mathbf{1}\left[\mathrm{PSI}^{some}_r(W)>\theta^{some}_r\right]
-
-$$
+For a resource r ∈ {cpu, mem, io} and a window W:
+```text
+stall(W) =
+  1 if PSI_full_r(W) > θ_full_r
+  OR
+  1 if PSI_some_r(W) > θ_some_r
+  else 0
+```
 
 Sustained stall over discrete samples:
-
-$$
-
-stall\_sust=\mathbf{1}\left[\sum_{k=1}^{m}stall(t-k\Delta t)\ge m\cdot p\right]
-
-$$
+```text
+stall_sust =
+  1 if sum_{k=1..m} stall(t - k*Δt) >= m*p
+  else 0
+```
 
 ### Minimal backend pressure (MVP-compatible)
+```text
+P_b = W_Q * Q*_b + W_L * L*_b + W_E * E*_b
 
-$$
-
-P_b = W_Q\cdot Q_b^* + W_L\cdot L_b^* + W_E\cdot E_b^*
-
-$$
-
-where
-
-$$
-
-Q_b^*=\frac{Q_b}{Q_{ref}},\quad L_b^*=\frac{p95\_lat_b}{L_{ref}},\quad E_b^*=\mathrm{clip}\left(\frac{err\_rate_b}{E_{ref}},0,E_{max}\right)
-
-$$
+Q*_b = Q_b / Q_ref
+L*_b = p95_lat_b / L_ref
+E*_b = clip(err_rate_b / E_ref, 0, E_max)
+```
 
 Optional “absolute” error penalty:
-
-$$
-
-\text{if } err\_rate_b>\eta \Rightarrow P_b \leftarrow P_b + K_E
-
-$$
+```text
+if err_rate_b > η:
+  P_b = P_b + K_E
+```
 
 ### Slot targets (inverse pressure) and viscous update
 Desired weight:
-
-$$
-
-w_b=\frac{\frac{1}{P_b+\epsilon}}{\sum_i \frac{1}{P_i+\epsilon}}
-
-$$
+```text
+w_b = (1/(P_b+ε)) / sum_i (1/(P_i+ε))
+```
 
 Target slots:
-
-$$
-
-s^{target}_b=\mathrm{round}(w_b\cdot S_{total})
-
-$$
+```text
+s_target_b = round(w_b * S_total)
+```
 
 Slew-rate (viscosity):
-
-$$
-
-\Delta s_b = \mathrm{clip}(s^{target}_b-s^{cur}_b,\,-\Delta_{max},+\Delta_{max})
-
-$$
-
-$$
-s^{new}_b=s^{cur}_b+\Delta s_b
-
-$$
+```text
+Δs_b = clip(s_target_b - s_cur_b, -Δ_max, +Δ_max)
+s_new_b = s_cur_b + Δs_b
+```
 
 ### Skew and monotonic guard
 Observed share:
-
-$$
-
-share_b=\frac{reqs_b}{\sum_i reqs_i+\epsilon}
-
-$$
+```text
+share_b = reqs_b / (sum_i reqs_i + ε)
+```
 
 Skew:
-
-$$
-
-skew=\max_b \left|share_b-w_b\right|
-
-$$
+```text
+skew = max_b |share_b - w_b|
+```
 
 Guard:
-
-$$
-
-\text{if }skew_{t+1}>skew_t+\varepsilon \Rightarrow \Delta_{max}\leftarrow k\Delta_{max}\ \text{or HOLD}
-
-$$
+```text
+if skew(t+1) > skew(t) + ε_guard:
+  Δ_max = k * Δ_max    (k < 1)
+  OR HOLD (freeze updates temporarily)
+```
 
 ### Conductance proxy and admission modes (backpressure)
-
-$$
-
-G=\sum_b \frac{slots_b}{P_b+\epsilon}
-
-$$
+```text
+G = sum_b (slots_b / (P_b + ε))
+```
 
 Mode selection (example):
-- **normal:** $TTF_{system}\ge T_{safe}$ and $stall\_sust=0$ and $G\ge G_{min}$
-- **soft:** $TTF_{system}<T_{safe}$ or $G<G_{min}$
-- **hard:** $TTF_{system}<T_{hard}$ or $stall\_sust=1$
+```text
+normal: (TTF_system >= T_safe) and (stall_sust == 0) and (G >= G_min)
+soft:   (TTF_system <  T_safe) or  (G <  G_min)
+hard:   (TTF_system <  T_hard) or  (stall_sust == 1)
+```
 
 ---
 
 # Articles 1–24
-
 Each article contains:
 - **Description** (what it means + why it exists)
-- **Metrics** (Real-time internal vs Audit)
-- **Equations** (minimal mathematical grounding)
+- **Metrics** (real-time internal vs audit)
+- **Equations** (plain-text grounding)
 
 ---
 
 ## Article 1 — O(1) Dataplane (Bounded Cost per Event)
 ### Description
-The dataplane must remain **O(1)** per packet/connection event. No per-backend scans, no loops over N backends, no dynamic allocations. This preserves throughput and prevents telemetry from becoming the bottleneck.
+The dataplane must remain **O(1)** per packet/connection event. No per-backend scans, no loops over N backends, no dynamic allocations.
 
 ### Metrics
 - **RT (internal):** `dp_event_cost_ns` (ring-buffer sampled), `dp_map_lookup_fail_total`
 - **Audit:** `dp_event_cost_ns_p50/p95/p99`, `dp_map_lookup_fail_total`
 
 ### Equations
-
-$$
-
-cost_{event}=t_{end}-t_{start}
-
-$$
-
-Bound invariant:
-
-$$
-
-p99(cost_{event}) \le B_{ns}
-
-$$
+```text
+cost_event = t_end - t_start
+p99(cost_event) <= B_ns
+```
 
 ---
 
 ## Article 2 — Full Physical Key (No Control-Volume Collisions)
 ### Description
-Every control volume is uniquely identified by physical boundary: **VIP + port + protocol (+ slot)**. Multi-port and multi-proto services must not interfere.
+Each control volume is uniquely identified by physical boundary: **VIP + port + protocol (+ slot)**.
 
 ### Metrics
 - **RT:** `route_keys_active`, `route_key_collision_total`
 - **Audit:** collision rate over time
 
 ### Equations
-
-$$
-
-route\_key = hash(vip, vport, proto, slot)
-
-$$
-
-$$
-collision\_rate=\frac{collisions}{lookups+\epsilon}
-
-$$
+```text
+route_key = hash(vip, vport, proto, slot)
+collision_rate = collisions / (lookups + ε)
+```
 
 ---
 
 ## Article 3 — Atomic Field Projection by Epoch (A/B Tables + Flip)
 ### Description
-The dataplane must never see a half-updated field. The control-plane writes the inactive table, then flips an **atomic pointer** (`active_table`) and increments **epoch**.
+Dataplane must never observe a half-updated field. Control-plane writes inactive table then flips `active_table` and increments `epoch`.
 
 ### Metrics
 - **RT:** `epoch_current`, `epoch_flip_total`, `agent_heartbeat_age_seconds`
 - **Audit:** epoch flip counts, staleness trends
 
 ### Equations
-
-$$
-
-staleness = now - last\_heartbeat
-
-$$
-
-Flip allowed only if:
-
-$$
-
-staleness \le \tau_{ok}
-
-$$
+```text
+staleness = now - last_heartbeat
+flip_allowed if staleness <= τ_ok
+```
 
 ---
 
 ## Article 4 — Laminar Gear + Real Stickiness (Deterministic Selection + Conntrack)
 ### Description
-Normal operation must not rely on randomness. Initial backend selection uses a deterministic “gear” (cyclic WRR over slots). Once a flow is assigned, it remains bound (stickiness) until an explicit remap reason occurs.
+No randomness in the normal regime. First selection is deterministic; then conntrack preserves flow continuity.
 
 ### Metrics
 - **RT:** `conntrack_hit_ratio`, `flow_remap_total{reason}`, `slot_pick_total{backend}`
 - **Audit:** hit ratio trends, remap reasons distribution
 
 ### Equations
-Initial pick:
+```text
+slot = counter mod S_total_slots
 
-$$
-
-slot = (counter \bmod S)
-
-$$
-
-Stickiness:
-
-$$
-
-hit\_ratio=\frac{hits}{hits+misses+\epsilon}
-
-$$
-
-Remap rate:
-
-$$
-
-remap\_rate=\frac{remaps}{flows\_sampled+\epsilon}
-
-$$
+hit_ratio = hits / (hits + misses + ε)
+remap_rate = remaps / (flows_sampled + ε)
+```
 
 ---
 
 ## Article 5 — Topological Continuity (Weighted Consistent Mapping Under Churn)
 ### Description
-When backends change, the field must not “reshuffle the universe.” Remaps should be **local and predictable**, minimizing turbulence caused by scaling and rescheduling.
+Topology changes must not reshuffle the universe. Remaps should be local and predictable.
 
 ### Metrics
 - **RT:** `backend_set_hash`, `table_rebuild_ms`
 - **Audit:** `remap_percent_on_churn`, `table_rebuild_ms_p95`
 
 ### Equations
-
-$$
-
-remap\_\% = \frac{\#(f: map_t(f)\ne map_{t-1}(f))}{\#flows\_sampled}\cdot 100
-
-$$
-
-Bound (policy):
-
-$$
-
-remap\_\% \le \rho_{max}\ \text{for small churn}
-
-$$
+```text
+remap_% = changed_flows / (flows_sampled + ε) * 100
+policy: remap_% <= ρ_max for small churn
+```
 
 ---
 
 ## Article 6 — Inertial Fail-Safe (HOLD → FALLBACK)
 ### Description
-The field must not obey a dead brain. If userspace/control-plane stops, the dataplane enters:
-1) **HOLD:** freeze the current field  
-2) **FALLBACK:** deterministic consistent selection without agent updates
+If the agent dies, dataplane remains coherent: HOLD first, then FALLBACK deterministic selection.
 
 ### Metrics
 - **RT:** `failsafe_mode{normal,hold,fallback}`, `agent_heartbeat_age_seconds`
 - **Audit:** mode time-series
 
 ### Equations
+```text
+age = now - last_heartbeat
 
-$$
-
-age = now - last\_heartbeat
-
-$$
-
-$$
-mode=
-\begin{cases}
-normal,& age<\tau_1\\
-hold,& \tau_1 \le age < \tau_2\\
-fallback,& age\ge\tau_2
-\end{cases}
-
-$$
+mode =
+  normal   if age < τ1
+  hold     if τ1 <= age < τ2
+  fallback if age >= τ2
+```
 
 ---
 
-## Article 7 — Layered Pressure (Separate Backend vs Path vs Node)
+## Article 7 — Layered Pressure (Backend vs Path vs Node)
 ### Description
-“Latency up” is not a single cause. Nity separates pressure into:
-- **Backend pressure** (queue, service latency, errors, connection load)
-- **Path pressure** (RTT/retrans/jitter)
-- **Node pressure** (PSI stall, fd/conntrack exhaustion, IO wait)
+Pressure is decomposed to avoid false positives: backend, path, and node.
 
 ### Metrics
 - **RT:** `pressure_backend{b}`, `pressure_path{b}`, `pressure_node{n}`
-- **Audit:** summaries per service/node
+- **Audit:** per service/node summaries
 
 ### Equations
-Backend (minimal form):
+```text
+P_backend(b) = WQ*Q*(b) + WL*L*(b) + WE*E*(b) + WC*C*(b)
 
-$$
-
-P_{backend}(b)=W_Q Q^*(b)+W_L L^*(b)+W_E E^*(b)+W_C C^*(b)
-
-$$
-
-Node (example):
-
-$$
-
-P_{node}(n)=W_{psi} PSI^*(n) + W_{fd} FD^*(n) + W_{ct} CT^*(n) + W_{io} IO^*(n)
-
-$$
+P_node(n) = Wpsi*PSI*(n) + Wfd*FD*(n) + Wct*CT*(n) + Wio*IO*(n)
+```
 
 ---
 
 ## Article 8 — Control Viscosity (Slew-Rate + Hysteresis + Filtering)
 ### Description
-The field must not react to noise. Updates are smoothed by filters, bounded by slew-rate, and protected by hysteresis to prevent flapping.
+Field does not react to noise. Filtering, slew-rate, and hysteresis prevent flapping.
 
 ### Metrics
-- **RT:** `slots_delta_per_cycle`, `flap_events_total`, `pressure_ema_alpha`
+- **RT:** `slots_delta_per_cycle`, `flap_events_total`
 - **Audit:** `slots_delta_p95`, flap rate per minute
 
 ### Equations
-Slew:
+```text
+Δs_b = clip(s_target_b - s_cur_b, -Δ_max, +Δ_max)
 
-$$
-
-\Delta s_b=\mathrm{clip}(s^{target}_b-s^{cur}_b,\,-\Delta_{max},+\Delta_{max})
-
-$$
-
-Hysteresis (example):
-
-$$
-
-update\ \text{only if}\ |P_b-P_{b,prev}|>\delta_P\ \text{for}\ T_{hold}
-
-$$
+hysteresis example:
+  apply updates only if |P_b - P_prev_b| > δP for at least T_hold
+```
 
 ---
 
-## Article 9 — Monotonic Convergence (The Field Must Not Worsen Skew)
+## Article 9 — Monotonic Convergence (Must Not Worsen Skew)
 ### Description
-Under normal regime, each control step should **reduce** imbalance (or at least not worsen it). If a step worsens skew, Nity shrinks the step or holds.
+A control step must not worsen skew under stable topology; otherwise shrink the step or HOLD.
 
 ### Metrics
 - **RT:** `skew_before`, `skew_after`, `monotonic_guard_trigger_total`
 - **Audit:** settling time, skew trends
 
 ### Equations
-
-$$
-
-skew=\max_b|share_b-w_b|
-
-$$
-
-Guard:
-
-$$
-
-\text{if } skew_{t+1} > skew_t + \varepsilon \Rightarrow \Delta_{max}\leftarrow k\Delta_{max}\ \text{or HOLD}
-
-$$
+```text
+skew = max_b |share_b - w_b|
+if skew_next > skew_now + ε_guard:
+  Δ_max = k*Δ_max  OR HOLD
+```
 
 ---
 
 ## Article 10 — Selective Permeability (Drip + Cooldown)
 ### Description
-A sick backend should not receive full traffic, but must never become invisible. Nity sends a **controlled diagnostic drip** (token bucket) and applies exponential cooldown on failures.
+Sick backends get diagnostic drip (token bucket) + exponential cooldown on failures.
 
 ### Metrics
 - **RT:** `drip_tokens{b}`, `drip_allow_total{b}`, `probe_success_ratio{b}`
 - **Audit:** drip rate, cooldown durations
 
 ### Equations
-Token bucket:
+```text
+tokens_b(t) = min(B, tokens_b(t-Δt) + r*Δt) - used
 
-$$
-
-tokens_b(t)=\min(B, tokens_b(t-\Delta t)+r\Delta t)-used
-
-$$
-
-Exponential cooldown:
-
-$$
-
-cooldown_{k+1}=\min(C_{max},\gamma\cdot cooldown_k)
-
-$$
+cooldown_{k+1} = min(C_max, γ*cooldown_k)
+```
 
 ---
 
 ## Article 11 — Evacuation Principle (Long-Lived Flows Under Degradation)
 ### Description
-A degraded backend must not only stop receiving new traffic; it must reduce its internal pressure. Nity uses staged draining:
-1) stop-new + slots→0  
-2) dynamic max-connection-age  
-3) aggressive shed (last resort; feature-flag)
+Degraded backend reduces internal pressure by staged draining (stop-new → max-conn-age → shed).
 
 ### Metrics
 - **RT:** `active_conns{b}`, `conn_age_p95{b}`, `shed_total{policy}`
 - **Audit:** shed events, retry impact
 
 ### Equations
-Dynamic max-connection-age (example):
-
-$$
-
-MCA = \mathrm{clip}\left(MCA_0 \cdot \frac{TTF}{TTF_{ref}},\ MCA_{min},\ MCA_{max}\right)
-
-$$
+```text
+MCA = clip(MCA0 * (TTF / TTF_ref), MCA_min, MCA_max)
+```
 
 ---
 
 ## Article 12 — Temporal Prediction (TTF)
 ### Description
-Health is not “current usage”; it is **time remaining to loss of control**. TTF estimates how long until a limit is reached at the current consumption velocity.
+Health is time remaining to loss of control.
 
 ### Metrics
 - **RT:** `ttf_resource_seconds{r}`, `ttf_node_seconds`, `ttf_system_seconds`
 - **Audit:** TTF minima and breach events
 
 ### Equations
+```text
+R_r = L_r - U_r
+V_r = v_{U_r}(t)
+TTF_r = R_r / max(ε, V_r)
 
-$$
-
-R_r=L_r-U_r,\quad V_r=v_{U_r}(t),\quad TTF_r=\frac{R_r}{\max(\epsilon,V_r)}
-
-$$
-
-$$
-TTF_{node}=\min_r(TTF_r),\quad TTF_{system}=\min(TTF_{node},TTF_{backend/system})
-
-$$
+TTF_node   = min_r TTF_r
+TTF_system = min(TTF_node, TTF_backend_or_system)
+```
 
 ---
 
 ## Article 13 — Stall Filter (PSI Defines Pathology)
 ### Description
-CPU 100% without stall can be healthy; CPU 100% with stall is pathological. PSI is the operational definition of “the kernel is failing to make progress.”
+Usage matters only if it causes stalls; PSI is the kernel progress indicator.
 
 ### Metrics
-- **RT:** `psi_cpu_some_10s/60s`, `psi_mem_full_10s/60s`, `stall_sust`
+- **RT:** `psi_*_some_10s/60s`, `psi_*_full_10s/60s`, `stall_sust`
 - **Audit:** PSI trend charts, stall breach counts
 
 ### Equations
-See PSI definitions in the global section:
-
-$$
-
-stall(W)=\mathbf{1}[\mathrm{PSI}^{full}(W)>\theta^{full}] \lor \mathbf{1}[\mathrm{PSI}^{some}(W)>\theta^{some}]
-
-$$
+```text
+stall(W) = 1 if PSI_full(W) > θ_full OR PSI_some(W) > θ_some else 0
+stall_sust = sustained stall over discrete samples
+```
 
 ---
 
-## Article 14 — Global Backpressure (The Circuit Breaker)
+## Article 14 — Global Backpressure (Circuit Breaker)
 ### Description
-System survival outranks external demand. If global conductance drops or TTF goes low, Nity activates backpressure at the boundary:
-- **soft:** bounded delay/rate-limit to avoid retry storms  
-- **hard:** deny new admissions (e.g., deny connect())
+System survival outranks external demand; boundary admission switches normal/soft/hard.
 
 ### Metrics
 - **RT:** `admission_mode{normal,soft,hard}`, `reject_total{class}`, `delay_injected_ms{class}`
 - **Audit:** mode time-series, rejection ratios
 
 ### Equations
+```text
+G = sum_b (slots_b / (P_b + ε))
 
-$$
+normal if (TTF_system >= T_safe) and (stall_sust == 0) and (G >= G_min)
+soft   if (TTF_system <  T_safe) or  (G <  G_min)
+hard   if (TTF_system <  T_hard) or  (stall_sust == 1)
 
-G=\sum_b \frac{slots_b}{P_b+\epsilon}
-
-$$
-
-Mode selection rule (example):
-- normal if $TTF_{system}\ge T_{safe}$, $stall\_sust=0$, $G\ge G_{min}$
-- soft if $TTF_{system}<T_{safe}$ or $G<G_{min}$
-- hard if $TTF_{system}<T_{hard}$ or $stall\_sust=1$
-
-Retry storm index (optional signal):
-
-$$
-
-RSI=\frac{retries/s}{success/s+\epsilon}
-
-$$
+optional:
+RSI = (retries/sec) / (success/sec + ε)
+```
 
 ---
 
 ## Article 15 — Local Sovereignty (Node Immune System)
 ### Description
-The agent serves its host first. If the local node violates physical limits, it must repel the load balancer by failing readiness before “saving the cluster.”
+The agent serves its own node first; if the node is unsafe, it fails readiness to shed load.
 
 ### Metrics
 - **RT:** `local_readiness_state`, `readiness_fail_total{reason}`
 - **Audit:** readiness flaps, reason distribution
 
 ### Equations
-
-$$
-
-ready=\mathbf{1}[TTF_{node}>T_{min}] \land \mathbf{1}[stall\_sust=0] \land \mathbf{1}[FD^*<\mu] \land \mathbf{1}[CT^*<\nu]
-
-$$
+```text
+ready =
+  1 if (TTF_node > T_min) and (stall_sust == 0) and (FD* < μ) and (CT* < ν)
+  else 0
+```
 
 ---
 
-## Article 16 — Pain Signaling (Reactive, Event-Driven, Ratelimited)
+## Article 16 — Pain Signaling (Event-Driven, Ratelimited)
 ### Description
-Inter-node communication is interrupt-driven: silence is normal. Nodes send “pain signals” only on state transitions (green→yellow→red), using UDP fire-and-forget with authentication and rate limits.
+Silence is normal; send pain only on state transitions (with auth + rate limits).
 
 ### Metrics
 - **RT:** `pain_signal_sent_total`, `pain_signal_drop_total{auth,replay,ratelimit}`
 - **Audit:** pain events per node, drop reasons
 
 ### Equations
-
-$$
-
-send=\mathbf{1}[state(t)\ne state(t-\Delta t)]
-
-$$
-
-Rate limit via token bucket (same structure as drip).
+```text
+send = 1 if state(t) != state(t-Δt) else 0
+rate limiting: token bucket (same structure as drip)
+```
 
 ---
 
 ## Article 17 — Fear Factor (Bounded Empathy With Decay)
 ### Description
-When a neighbor falls, a healthy node pre-emptively tightens its own thresholds (“the load will come to me”). This must be bounded to avoid cascades, and must decay back to baseline.
+Neighbor distress tightens local thresholds, bounded and decaying back to baseline.
 
 ### Metrics
 - **RT:** `fear_factor_active`, `fear_delta_threshold_pct`
 - **Audit:** cascade cap hits, fear durations
 
 ### Equations
-Bounded reduction:
+```text
+Δθ = min(θ_max_drop, k*severity)
 
-$$
+θ(t) = θ0 * (1 - Δθ * exp(-(t - t0)/τ))
 
-\Delta\theta = \min(\theta_{max\_drop}, k\cdot severity)
-
-$$
-
-Decay:
-
-$$
-
-\theta(t)=\theta_0\cdot(1-\Delta\theta\cdot e^{-\frac{t-t_0}{\tau}})
-
-$$
-
-Anti-cascade cap:
-
-$$
-
-\Delta\theta \le \Delta\theta_{cap}\ \text{if many neighbors are red}
-
-$$
+anti-cascade cap:
+  Δθ <= Δθ_cap if too many neighbors are red
+```
 
 ---
 
 ## Article 18 — Stigmergy (In-Band Telemetry With Staleness Rules)
 ### Description
-State travels attached to traffic (headers/metadata). There is no separate control channel that can desync. In-band telemetry must be versioned and time-bounded.
+State travels with the traffic. In-band telemetry must be versioned and time-bounded.
 
 ### Metrics
 - **RT:** `inband_parse_fail_total`, `inband_stale_drop_total`
 - **Audit:** schema versions seen, drop rates
 
 ### Equations
+```text
+stale = 1 if (now - ts) > TTL else 0
 
-$$
-
-stale=\mathbf{1}[now-ts>TTL]
-
-$$
-
-$$
-accept=\mathbf{1}[schema\_ver\in supported]\land \mathbf{1}[stale=0]
-
-$$
+accept =
+  1 if (schema_ver is supported) and (stale == 0)
+  else 0
+```
 
 ---
 
 ## Article 19 — Reaction Ladder (Three-Stage Crisis Protocol)
 ### Description
-Response follows a cost hierarchy:
-1) **Traffic stress:** scale pods / adjust traffic allocation  
-2) **Resource stress:** scale node resources / limits  
-3) **Systemic stress:** scale nodes/cluster
-
-Nity chooses stage based on which constraints dominate (TTF vs PSI vs conductance).
+Actions follow a cost hierarchy: (1) traffic, (2) resources, (3) territory (nodes/cluster).
 
 ### Metrics
 - **RT:** `reaction_stage{1,2,3}`, `scaling_action_total{type}`
 - **Audit:** action outcomes, stage distribution
 
-### Equations (example rule-set)
-
-$$
-
-stage=
-\begin{cases}
-1,& TTF_{backend}<T_{scale}\ \land stall\_sust=0\\
-2,& stall\_sust=1\ \land (mem/io)\ \text{dominates}\\
-3,& G<G_{min}\ \land \text{no local headroom}
-\end{cases}
-
-$$
+### Equations (example rules)
+```text
+stage =
+  1 if (TTF_backend < T_scale) and (stall_sust == 0)
+  2 if (stall_sust == 1) and (mem/io dominates)
+  3 if (G < G_min) and (no local headroom)
+```
 
 ---
 
 ## Article 20 — Surge Tank (Bounded Shock Absorber During Scaling)
 ### Description
-During scaling, Nity may temporarily buffer handshakes to avoid hydraulic shock. This buffer must be bounded and integrated with retry-storm protection.
+Temporary buffering of handshakes during scaling is allowed but must be bounded and RSI-aware.
 
 ### Metrics
 - **RT:** `handshake_buffer_depth`, `handshake_wait_ms_p95`, `handshake_drop_total`
 - **Audit:** wait distributions, drops vs RSI
 
 ### Equations
-Bound:
+```text
+depth <= D_max
 
-$$
+drop =
+  1 if depth >= D_max OR RSI > r_max
+  else 0
 
-depth \le D_{max}
-
-$$
-
-Drop rule:
-
-$$
-
-drop=\mathbf{1}[depth\ge D_{max}] \lor \mathbf{1}[RSI>r_{max}]
-
-$$
-
-Wait time:
-
-$$
-
-wait=t_{accepted}-t_{arrived}
-
-$$
+wait = t_accepted - t_arrived
+```
 
 ---
 
 ## Article 21 — Proportional Drainage (Queue Debt Must Be Paid)
 ### Description
-After scaling or recovery, backlog acts as “debt.” Newly available capacity must not be flooded instantly; reported pressure includes debt clearance time.
+Backlog is “debt”. Pressure includes debt clearance time to avoid flooding new capacity.
 
 ### Metrics
 - **RT:** `queue_debt{b}`, `time_to_clear_debt_seconds{b}`
 - **Audit:** debt clearance curves
 
 ### Equations
+```text
+debt = max(0, Q_accum)
 
-$$
+T_drain = debt / (drain_rate + ε)
 
-debt=\max(0,Q_{accum})
-
-$$
-
-$$
-T_{drain}=\frac{debt}{drain\_rate+\epsilon}
-
-$$
-
-$$
-P_{real}=\frac{traffic + debt/T_{drain}}{capacity}
-
-$$
+P_real = (traffic + debt/T_drain) / capacity
+```
 
 ---
 
 ## Article 22 — Identity & Security (Physics Cannot Violate Law)
 ### Description
-Traffic may flow only where identity allows. The field is subordinate to security policy (labels/network policies). No “optimization” can bypass authorization.
+Field decisions are subordinate to security policies (labels, network policies). No bypass.
 
 ### Metrics
 - **RT:** `policy_denies_total{reason}`, `unauthorized_flow_attempt_total`
 - **Audit:** denies by namespace/service, drift detection
 
 ### Equations
-
-$$
-
-allow=\mathbf{1}[policy(src,dst,svc)=allow]
-
-$$
+```text
+allow = 1 if policy(src, dst, svc) == allow else 0
+```
 
 ---
 
 ## Article 23 — Deterministic Simplicity (Every Action Has a Physical Cause)
 ### Description
-Every action must map to a finite set of physical reasons (TTF, PSI stall, error, skew, guard). No black-box decisioning is constitutional.
+Every action must map to explicit physical reasons. No black-box decisions.
 
 ### Metrics
 - **RT:** `decision_reason_total{reason}`, `decision_event_rate`
-- **Audit:** reason distribution over time, “unknown reason” must be zero
+- **Audit:** reason distribution; unknown reason must be 0
 
-### Equations (reason selection)
-Define normalized scores (examples):
+### Equations (example)
+```text
+score_ttf  = 1 if TTF_system < T_safe else 0
+score_psi  = stall_sust
+score_err  = 1 if err_rate > η else 0
+score_skew = 1 if skew > skew_max else 0
 
-$$
-
-score_{ttf}=\mathbf{1}[TTF_{system}<T_{safe}],\quad score_{psi}=stall\_sust,\quad score_{err}=\mathbf{1}[err\_rate>\eta]
-
-$$
-
-$$
-reason(a)=\arg\max_{k\in\{ttf,psi,err,skew,guard\}} score_k
-
-$$
+reason = argmax_k(score_k)  for k ∈ {ttf, psi, err, skew}
+```
 
 ---
 
 ## Article 24 — Invariant Harness (Physics CI: Sim + Replay)
 ### Description
-If you cannot test and observe it, you cannot operate it. Nity must ship with a harness that validates invariants (bounded overhead, monotonic skew, no-blackhole, bounded remap, etc.) through simulation and replay.
+Ship a harness that validates invariants under simulation and replay (no-blackhole, bounded overhead, monotonic skew, bounded remap).
 
 ### Metrics
 - **RT:** `invariant_fail_fast_total{test}` (optional)
 - **Audit:** `invariant_pass{test}`, `max_remap_pct`, `max_flap_rate`, `dp_cost_p99`
 
-### Equations (examples of invariants)
-Bounded dataplane cost:
+### Equations (examples)
+```text
+bounded dataplane:
+  p99(dp_event_cost) <= B_ns
 
-$$
+monotonic skew (stable topology):
+  skew(t+1) <= skew(t) + ε_guard
 
-p99(dp\_event\_cost)\le B_{ns}
-
-$$
-
-Monotonic skew (under stable topology):
-
-$$
-
-skew_{t+1}\le skew_t+\varepsilon
-
-$$
-
-No-blackhole post-admission:
-
-$$
-
-admitted = delivered + explicitly\_rejected
-
-$$
+no-blackhole post-admission:
+  admitted == delivered + explicitly_rejected
+```
 
 ---
 
 ## Appendix A — Metric Conventions (Recommended Names)
-- RT (in-memory / flight recorder): `rt_*` or structured events (JSON/proto)
-- Audit (Prometheus): low-cardinality gauges/counters/histograms
+- RT (in-memory / flight recorder): structured events or `rt_*`
+- Audit (Prometheus): low-cardinality counters/gauges/histograms
   - `nity_epoch_current`
   - `nity_admission_mode`
   - `nity_ttf_system_seconds`
-  - `nity_dp_event_cost_ns_bucket` (histogram)
+  - `nity_dp_event_cost_ns_bucket`
   - `nity_skew`
   - `nity_guard_hits_total`
   - `nity_reject_total{class}` (keep class cardinality bounded)
@@ -815,16 +570,19 @@ $$
 ---
 
 ## Appendix B — Defaults (Good Starting Points)
-> These are starting points, not truth. They exist to make the system immediately operable.
+These are starting points, not truth.
 
-- Δt: 200ms
-- Δ (robust derivative window): 5s
-- Δmax (slots/cycle): 1–3 (per backend)
-- τ1 (HOLD): 2–5s
-- τ2 (FALLBACK): 10–20s
-- PSI windows: 10s + 60s
-- $T_{safe}$: 60–180s, $T_{hard}$: 10–30s (depends on scale reaction time)
+```text
+Δt: 200ms
+Δ:  5s
+Δ_max (slots/cycle): 1–3 per backend
+τ1 (HOLD): 2–5s
+τ2 (FALLBACK): 10–20s
+PSI windows: 10s and 60s
+T_safe: 60–180s
+T_hard: 10–30s
+```
 
 ---
 
-**End of Constitution v5.0**
+**End of Constitution**
