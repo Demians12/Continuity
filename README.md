@@ -1,13 +1,13 @@
 # Continuity
 **Deterministic traffic continuity for Kubernetes, inspired by Eulerian fluid mechanics.**
 
-Nity treats service traffic as **fluid** and backends as fixed points on a mesh. Instead of tracking individual requests in the decision layer (Lagrangian view), it controls **pressure fields** and **flow capacity** at **backend slots** (Eulerian view) to keep traffic moving, predict loss of control early, and avoid oscillations.
+Continuity (or just Nity) treats service traffic as **fluid** and backends as fixed points on a mesh. Instead of tracking individual requests in the decision layer (Lagrangian view), it controls **pressure fields** and **flow capacity** at **backend slots** (Eulerian view) to keep traffic moving, predict loss of control early, and avoid oscillations.
 
 Nity is built as a **kernel dataplane (eBPF)** plus a **deterministic control-plane**. The dataplane stays **O(1)** per connection event; the control-plane updates the “field” in discrete ticks and can fail-safe without blackholing.
 
 ---
 
-## What Nity is (and is not)
+## What is it? (and is not)
 
 **Nity is:**
 - A **continuity controller** for Kubernetes traffic (prioritizes flow stability over “perfect routing”).
@@ -61,7 +61,7 @@ Why per-node agent (DaemonSet)? Because sensors and actuators are node-local: it
 
 ---
 
-## Regimes vs states (don’t mix them)
+## Regimes and states 
 
 **Regimes** are high-level postures:
 - **Laminar (normal):** stable flow, small corrections, high predictability
@@ -110,7 +110,6 @@ If you submit a change that affects behavior, please describe which invariant(s)
 
 ## License
 Planned: Apache-2.0 (or similar permissive license).  
-(If `LICENSE` isn’t present yet, it will be added early to avoid ambiguity.)
 
 ---
 
