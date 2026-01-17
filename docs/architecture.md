@@ -76,34 +76,33 @@ This is how Nity aims to keep **continuity** even when conditions degrade:
 
 ```mermaid
 flowchart TB
-  subgraph Node["Kubernetes Node"]
-    direction TB
-
-    subgraph Kernel["Kernel / eBPF Dataplane"]
-      DP["Nity eBPF Programs\n(sockops/connect4; optional tc/xdp)"]
-      Maps["BPF Maps\n- slot_table_A/B\n- active_table + epoch\n- conntrack LRU\n- rt_control\n- counters\n- last_agent_seen"]
-    end
-
-    subgraph User["Userspace Control Plane"]
-      Agent["nity-agent (DaemonSet)\ncontrol loop Δt"]
-      Exporter["(optional) nity-exporter\nPrometheus audit"]
-      Recorder["Flight Recorder\nRT events / debug"]
-    end
-
-    Agent -->|read| Maps
-    Agent -->|write inactive + flip| Maps
-    DP -->|lookup| Maps
-    DP -->|update conntrack/counters| Maps
-
-    Agent --> Recorder
-    Exporter -->|scrape summaries| Agent
+ subgraph Kernel["Kernel / eBPF Dataplane"]
+        DP["Nity eBPF Programs (sockops/connect4; optional tc/xdp)"]
+        Maps["BPF Maps - slot_table_A/B - active_table + epoch - conntrack LRU - rt_control - counters - last_agent_seen"]
   end
+ subgraph User["Userspace Control Plane"]
+        Agent["nity-agent (DaemonSet) control loop Δt"]
+        Exporter["(optional) nity-exporter Prometheus audit"]
+        Recorder["Flight Recorder RT events / debug"]
+  end
+ subgraph Node["Kubernetes Node"]
+    direction TB
+        Kernel
+        User
+  end
+    Agent -- read --> Maps
+    Agent -- write inactive + flip --> Maps
+    DP -- lookup --> Maps
+    DP -- update conntrack/counters --> Maps
+    Agent --> Recorder
+    Exporter -- scrape summaries --> Agent
+    Client["Clients / Ingress / LB"] -- connect() --> DP
+    DP -- route to backend --> BackendPods["Backend Pods (same service selector)"]
+    Prom["Prometheus/Grafana (audit)"] L_Prom_Exporter_0@-- scrape --> Exporter
+    Harness["Harness (sim + replay)"] --> Agent
 
-  Client["Clients / Ingress / LB"] -->|connect()| DP
-  DP -->|route to backend| BackendPods["Backend Pods (same service selector)"]
 
-  Prom["Prometheus/Grafana\n(audit)"] -->|scrape| Exporter
-  Harness["Harness\n(sim + replay)"] --> Agent
+    L_Prom_Exporter_0@{ curve: natural }
 ```
 
 ---
