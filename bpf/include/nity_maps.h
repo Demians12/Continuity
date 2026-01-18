@@ -1,86 +1,126 @@
-#ifndef NITY_MAPS_H
-#define NITY_MAPS_H
+// SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+#pragma once
 
 #include <linux/bpf.h>
-#include <bpf/bpf_helpers.h>
+#include <linux/types.h>
+
 #include "nity_common.h"
-#include "nity_metrics.h"
 
-/*
- * IMPORTANT:
- * - Keep map sizes conservative for MVP; tune later.
- * - Keys/values MUST match exactly what userspace (agent/loader) expects.
- */
+// Minimal libbpf-style map definition macros (avoid external bpf_helpers.h).
+#ifndef SEC
+#define SEC(NAME) __attribute__((section(NAME), used))
+#endif
 
-/* Slot tables: route_key -> backend */
+#ifndef __uint
+#define __uint(name, val) int (*name)[val]
+#endif
+#ifndef __type
+#define __type(name, val) val *name
+#endif
+
+// libbpf pinning constants (kept local to avoid external headers).
+#ifndef LIBBPF_PIN_NONE
+#define LIBBPF_PIN_NONE 0
+#endif
+#ifndef LIBBPF_PIN_BY_NAME
+#define LIBBPF_PIN_BY_NAME 2
+#endif
+
+// ----------------------------
+// Size knobs (bounded maps)
+// ----------------------------
+#define NITY_MAX_SLOT_ENTRIES      65536u
+#define NITY_MAX_ROUTE_GROUPS      4096u
+#define NITY_MAX_FALLBACK_BACKENDS 16384u
+#define NITY_MAX_CONNTRACK_ENTRIES 65536u
+
+// ----------------------------
+// Required maps (RFC0004)
+// ----------------------------
+
+// 6.1 Slot tables (A/B)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 131072);
-    __type(key, struct nity_route_key);
-    __type(value, struct nity_backend);
+    __uint(max_entries, NITY_MAX_SLOT_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, __u64); // route_key
+    __type(value, struct nity_backend_id);
 } slot_table_A SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 131072);
-    __type(key, struct nity_route_key);
-    __type(value, struct nity_backend);
+    __uint(max_entries, NITY_MAX_SLOT_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, __u64); // route_key
+    __type(value, struct nity_backend_id);
 } slot_table_B SEC(".maps");
 
-/* Active table selector: index 0 -> u32 (0=A, 1=B) */
+// 6.2 Active table selector + epoch
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
-    __type(value, __u32);
+    __type(value, __u32); // enum nity_active_table
 } active_table SEC(".maps");
 
-/* Epoch: index 0 -> u64 */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, __u64);
 } epoch SEC(".maps");
 
-/* Admission mode: index 0 -> u32 (normal/soft/hard) */
+// 6.3 Conntrack LRU
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, NITY_MAX_CONNTRACK_ENTRIES);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, __u64); // flow_key
+    __type(value, struct nity_conntrack_val);
+} conntrack_lru SEC(".maps");
+
+// 6.4 Agent heartbeat
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
-    __type(value, __u32);
-} admission_mode SEC(".maps");
+    __type(value, __u64); // ns timestamp
+} last_agent_seen_ts SEC(".maps");
 
-/* Per-route config: (vip,port,proto) -> cfg(total_slots, ...) */
+// 6.5 Control map (per route group)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 32768);
-    __type(key, struct nity_route_id);
-    __type(value, struct nity_route_cfg);
-} route_cfg SEC(".maps");
+    __uint(max_entries, NITY_MAX_ROUTE_GROUPS);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, __u64); // route_group_key
+    __type(value, struct nity_rt_control);
+} rt_control SEC(".maps");
 
-/* Per-route deterministic gear counter: (vip,port,proto) -> u32 counter */
+// 7. Option A fallback backend sets
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 32768);
-    __type(key, struct nity_route_id);
-    __type(value, __u32);
-} route_counter SEC(".maps");
+    __uint(max_entries, NITY_MAX_ROUTE_GROUPS);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, __u64); // route_group_key
+    __type(value, __u32); // N
+} fallback_size SEC(".maps");
 
-/* Conntrack stickiness (MVP): flow_key -> backend + epoch + ts */
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 262144);
-    __type(key, struct nity_flow_key);
-    __type(value, struct nity_flow_val);
-} conntrack_LRU SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, NITY_MAX_FALLBACK_BACKENDS);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __type(key, struct nity_fallback_key);
+    __type(value, struct nity_backend_id);
+} fallback_backends SEC(".maps");
 
-/* Per-CPU counters (index 0 -> struct nity_counters) */
+// 6.6 Counters (per-CPU where possible)
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, NITY_C_MAX);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
-    __type(value, struct nity_counters);
+    __type(value, __u64);
 } counters SEC(".maps");
-
-#endif /* NITY_MAPS_H */
